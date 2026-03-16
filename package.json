@@ -1,0 +1,18 @@
+{
+  "name": "ga4-revenue-oauth-backend",
+  "version": "1.0.0",
+  "description": "Backend API OAuth2 pour agréger les revenus multi-GA4",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@google-analytics/data": "^4.8.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.3.1",
+    "express": "^4.21.0",
+    "express-session": "^1.18.1",
+    "googleapis": "^144.0.0"
+  }
+}
