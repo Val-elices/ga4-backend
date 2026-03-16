@@ -23,6 +23,7 @@ app.use(
   })
 );
 
+app.set("trust proxy", 1);
 app.use(
   session({
     secret: SESSION_SECRET,
@@ -31,7 +32,7 @@ app.use(
     cookie: {
       secure: process.env.NODE_ENV === "production",
       sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 jours
+      maxAge: 30 * 24 * 60 * 60 * 1000,
     },
   })
 );
