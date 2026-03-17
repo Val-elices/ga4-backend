@@ -187,10 +187,16 @@ function formatDate(yyyymmdd) {
 // Route principale : revenus agrégés
 app.get("/api/revenue", requireAuth, async (req, res) => {
   try {
-    const { days = 30 } = req.query;
-    const daysNum = parseInt(days);
-    const endDate = "today";
-    const startDate = `${daysNum}daysAgo`;
+	const { days = 30, startDate: qStart, endDate: qEnd } = req.query;
+	let startDate, endDate;
+	if (qStart && qEnd) {
+	  startDate = qStart;
+	  endDate = qEnd;
+	} else {
+	  const daysNum = parseInt(days);
+	  startDate = `${daysNum}daysAgo`;
+	  endDate = "today";
+	}
 
     const authClient = getAuthenticatedClient(req.session.tokens);
     const properties = getProperties();
