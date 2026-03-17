@@ -188,12 +188,12 @@ function formatDate(yyyymmdd) {
 app.get("/api/revenue", requireAuth, async (req, res) => {
   try {
 	const { days = 30, startDate: qStart, endDate: qEnd } = req.query;
+	const daysNum = parseInt(days);
 	let startDate, endDate;
 	if (qStart && qEnd) {
 	  startDate = qStart;
 	  endDate = qEnd;
 	} else {
-	  const daysNum = parseInt(days);
 	  startDate = `${daysNum}daysAgo`;
 	  endDate = "today";
 	}
