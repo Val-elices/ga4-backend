@@ -116,7 +116,7 @@ function getAuthenticatedClient(tokens) {
 }
 
 // ════════════════════════════════════════════════════════
-// HELPER: parse dates
+// HELPERS
 // ════════════════════════════════════════════════════════
 
 function parseDateRange(query) {
@@ -137,8 +137,18 @@ function formatDate(yyyymmdd) {
   return `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
 }
 
+function fmt(d) {
+  return d.toISOString().split("T")[0];
+}
+
+function getDateNDaysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d;
+}
+
 // ════════════════════════════════════════════════════════
-// REVENUE ROUTE (existing)
+// REVENUE
 // ════════════════════════════════════════════════════════
 
 async function fetchRevenue(authClient, propertyId, startDate, endDate) {
@@ -216,87 +226,86 @@ app.get("/api/revenue", requireAuth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════
-// TRAFFIC ROUTE (new)
+// TRAFFIC (sessions-based, organic search by channel group)
 // ════════════════════════════════════════════════════════
 
-async function fetchTraffic(authClient, propertyId, startDate, endDate) {
+async function fetchTrafficSessions(authClient, propertyId, startDate, endDate) {
   try {
     const analyticsClient = new BetaAnalyticsDataClient({ authClient });
 
-    // Total traffic
+    // Total sessions
     const [totalRes] = await analyticsClient.runReport({
       property: `properties/${propertyId}`,
       dateRanges: [{ startDate, endDate }],
-      metrics: [{ name: "sessions" }, { name: "totalUsers" }],
+      metrics: [{ name: "sessions" }],
     });
-
     const totalSessions = totalRes.rows?.[0] ? parseInt(totalRes.rows[0].metricValues[0].value) || 0 : 0;
-    const totalUsers = totalRes.rows?.[0] ? parseInt(totalRes.rows[0].metricValues[1].value) || 0 : 0;
 
-    // Traffic by channel (to get organic)
+    // Organic sessions via sessionDefaultChannelGroup
     const [channelRes] = await analyticsClient.runReport({
       property: `properties/${propertyId}`,
       dateRanges: [{ startDate, endDate }],
       dimensions: [{ name: "sessionDefaultChannelGroup" }],
-      metrics: [{ name: "sessions" }, { name: "totalUsers" }],
+      metrics: [{ name: "sessions" }],
     });
 
     let organicSessions = 0;
-    let organicUsers = 0;
     (channelRes.rows || []).forEach((row) => {
-      const channel = row.dimensionValues[0].value.toLowerCase();
-      if (channel === "organic search") {
+      if (row.dimensionValues[0].value.toLowerCase() === "organic search") {
         organicSessions = parseInt(row.metricValues[0].value) || 0;
-        organicUsers = parseInt(row.metricValues[1].value) || 0;
       }
     });
 
-    return { totalSessions, totalUsers, organicSessions, organicUsers };
+    return { totalSessions, organicSessions };
   } catch (error) {
     console.error(`Erreur GA4 traffic ${propertyId}:`, error.message);
-    return { totalSessions: 0, totalUsers: 0, organicSessions: 0, organicUsers: 0 };
+    return { totalSessions: 0, organicSessions: 0 };
   }
 }
 
-async function fetchOrganicMonthly(authClient, propertyId, startDate, endDate) {
+async function fetchOrganicMonthly(authClient, propertyId) {
   try {
     const analyticsClient = new BetaAnalyticsDataClient({ authClient });
+
+    // Get monthly sessions with channel group dimension, then filter organic
     const [response] = await analyticsClient.runReport({
       property: `properties/${propertyId}`,
-      dateRanges: [{ startDate, endDate }],
-      dimensions: [{ name: "yearMonth" }],
-      dimensionFilter: {
-        filter: {
-          fieldName: "sessionDefaultChannelGroup",
-          stringFilter: { matchType: "EXACT", value: "Organic Search", caseSensitive: false },
-        },
-      },
-      metrics: [{ name: "sessions" }, { name: "totalUsers" }],
+      dateRanges: [{ startDate: "25monthsAgo", endDate: "today" }],
+      dimensions: [
+        { name: "yearMonth" },
+        { name: "sessionDefaultChannelGroup" },
+      ],
+      metrics: [{ name: "sessions" }],
       orderBys: [{ dimension: { dimensionName: "yearMonth" }, desc: false }],
     });
 
-    return (response.rows || []).map((row) => ({
-      yearMonth: row.dimensionValues[0].value,
-      sessions: parseInt(row.metricValues[0].value) || 0,
-      users: parseInt(row.metricValues[1].value) || 0,
-    }));
+    const monthlyMap = {};
+    (response.rows || []).forEach((row) => {
+      const ym = row.dimensionValues[0].value;
+      const channel = row.dimensionValues[1].value.toLowerCase();
+      if (channel === "organic search") {
+        monthlyMap[ym] = (monthlyMap[ym] || 0) + (parseInt(row.metricValues[0].value) || 0);
+      }
+    });
+
+    return Object.entries(monthlyMap)
+      .map(([yearMonth, sessions]) => ({ yearMonth, sessions }))
+      .sort((a, b) => a.yearMonth.localeCompare(b.yearMonth));
   } catch (error) {
     console.error(`Erreur GA4 organic monthly ${propertyId}:`, error.message);
     return [];
   }
 }
 
-// Main traffic endpoint
 app.get("/api/traffic", requireAuth, async (req, res) => {
   try {
     const { startDate, endDate } = parseDateRange(req.query);
     const authClient = getAuthenticatedClient(req.session.tokens);
     const properties = getProperties();
 
-    // Calculate previous month and previous year ranges
+    // Calculate comparison periods
     const now = new Date();
-    let currentStart, currentEnd, prevMonthStart, prevMonthEnd, prevYearStart, prevYearEnd;
-
+    let currentStart, currentEnd;
     if (req.query.startDate && req.query.endDate) {
       currentStart = new Date(req.query.startDate);
       currentEnd = new Date(req.query.endDate);
@@ -306,30 +315,27 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
       currentStart.setDate(currentStart.getDate() - (parseInt(req.query.days) || 30));
     }
 
-    const diffMs = currentEnd - currentStart;
-    const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+    const diffDays = Math.ceil((currentEnd - currentStart) / (1000 * 60 * 60 * 24));
 
-    // Previous month (m-1): same duration, shifted back by that duration
-    prevMonthEnd = new Date(currentStart);
+    // M-1: previous equivalent period
+    const prevMonthEnd = new Date(currentStart);
     prevMonthEnd.setDate(prevMonthEnd.getDate() - 1);
-    prevMonthStart = new Date(prevMonthEnd);
+    const prevMonthStart = new Date(prevMonthEnd);
     prevMonthStart.setDate(prevMonthStart.getDate() - diffDays);
 
-    // Previous year (n-1): same dates but one year ago
-    prevYearStart = new Date(currentStart);
+    // N-1: same dates one year ago
+    const prevYearStart = new Date(currentStart);
     prevYearStart.setFullYear(prevYearStart.getFullYear() - 1);
-    prevYearEnd = new Date(currentEnd);
+    const prevYearEnd = new Date(currentEnd);
     prevYearEnd.setFullYear(prevYearEnd.getFullYear() - 1);
-
-    const fmt = (d) => d.toISOString().split("T")[0];
 
     const results = await Promise.all(
       properties.map(async (prop) => {
         const [current, prevMonth, prevYear, monthlyOrganic] = await Promise.all([
-          fetchTraffic(authClient, prop.propertyId, startDate, endDate),
-          fetchTraffic(authClient, prop.propertyId, fmt(prevMonthStart), fmt(prevMonthEnd)),
-          fetchTraffic(authClient, prop.propertyId, fmt(prevYearStart), fmt(prevYearEnd)),
-          fetchOrganicMonthly(authClient, prop.propertyId, "13monthsAgo", "today"),
+          fetchTrafficSessions(authClient, prop.propertyId, startDate, endDate),
+          fetchTrafficSessions(authClient, prop.propertyId, fmt(prevMonthStart), fmt(prevMonthEnd)),
+          fetchTrafficSessions(authClient, prop.propertyId, fmt(prevYearStart), fmt(prevYearEnd)),
+          fetchOrganicMonthly(authClient, prop.propertyId),
         ]);
 
         const organicVsM1 = prevMonth.organicSessions > 0
@@ -345,9 +351,7 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
           name: prop.name,
           propertyId: prop.propertyId,
           totalSessions: current.totalSessions,
-          totalUsers: current.totalUsers,
           organicSessions: current.organicSessions,
-          organicUsers: current.organicUsers,
           organicVsM1: Math.round(organicVsM1 * 10) / 10,
           organicVsN1: Math.round(organicVsN1 * 10) / 10,
           prevMonthOrganic: prevMonth.organicSessions,
@@ -357,7 +361,7 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
       })
     );
 
-    // Global average evolution (not sum of %)
+    // Global averages
     const validM1 = results.filter((r) => r.prevMonthOrganic > 0);
     const validN1 = results.filter((r) => r.prevYearOrganic > 0);
     const avgM1 = validM1.length > 0
@@ -367,9 +371,6 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
       ? Math.round((validN1.reduce((s, r) => s + r.organicVsN1, 0) / validN1.length) * 10) / 10
       : 0;
 
-    const totalOrganic = results.reduce((s, r) => s + r.organicSessions, 0);
-    const totalSessions = results.reduce((s, r) => s + r.totalSessions, 0);
-
     if (authClient.credentials.access_token !== req.session.tokens.access_token) {
       req.session.tokens = authClient.credentials;
     }
@@ -378,8 +379,8 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
       success: true,
       clients: results,
       summary: {
-        totalSessions,
-        totalOrganic,
+        totalSessions: results.reduce((s, r) => s + r.totalSessions, 0),
+        totalOrganic: results.reduce((s, r) => s + r.organicSessions, 0),
         avgOrganicVsM1: avgM1,
         avgOrganicVsN1: avgN1,
         clientCount: results.length,
@@ -387,6 +388,86 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
     });
   } catch (error) {
     console.error("Erreur API traffic:", error);
+    if (error.code === 401 || error.message?.includes("invalid_grant")) {
+      req.session.destroy();
+      return res.status(401).json({ success: false, error: "Session expirée." });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════
+// CUMULATIVE GROWTH (all clients combined)
+// ════════════════════════════════════════════════════════
+
+app.get("/api/growth", requireAuth, async (req, res) => {
+  try {
+    const authClient = getAuthenticatedClient(req.session.tokens);
+    const properties = getProperties();
+
+    // Periods: 1m, 6m, 12m, 18m, 24m
+    const periods = [
+      { label: "1 mois", days: 30 },
+      { label: "6 mois", days: 180 },
+      { label: "12 mois", days: 365 },
+      { label: "18 mois", days: 548 },
+      { label: "24 mois", days: 730 },
+    ];
+
+    const growthResults = [];
+
+    for (const period of periods) {
+      const currentEnd = new Date();
+      const currentStart = new Date();
+      currentStart.setDate(currentStart.getDate() - period.days);
+
+      const prevEnd = new Date(currentStart);
+      prevEnd.setDate(prevEnd.getDate() - 1);
+      const prevStart = new Date(prevEnd);
+      prevStart.setDate(prevStart.getDate() - period.days);
+
+      // Fetch organic sessions for all properties for current and previous periods
+      const results = await Promise.all(
+        properties.map(async (prop) => {
+          const [current, prev] = await Promise.all([
+            fetchTrafficSessions(authClient, prop.propertyId, fmt(currentStart), fmt(currentEnd)),
+            fetchTrafficSessions(authClient, prop.propertyId, fmt(prevStart), fmt(prevEnd)),
+          ]);
+          return {
+            currentOrganic: current.organicSessions,
+            prevOrganic: prev.organicSessions,
+          };
+        })
+      );
+
+      // Cumulative: sum all clients organic sessions, then compute growth
+      const totalCurrentOrganic = results.reduce((s, r) => s + r.currentOrganic, 0);
+      const totalPrevOrganic = results.reduce((s, r) => s + r.prevOrganic, 0);
+
+      const growth = totalPrevOrganic > 0
+        ? ((totalCurrentOrganic - totalPrevOrganic) / totalPrevOrganic) * 100
+        : 0;
+
+      growthResults.push({
+        label: period.label,
+        days: period.days,
+        currentOrganic: totalCurrentOrganic,
+        prevOrganic: totalPrevOrganic,
+        growth: Math.round(growth * 10) / 10,
+      });
+    }
+
+    if (authClient.credentials.access_token !== req.session.tokens.access_token) {
+      req.session.tokens = authClient.credentials;
+    }
+
+    res.json({
+      success: true,
+      growth: growthResults,
+      clientCount: properties.length,
+    });
+  } catch (error) {
+    console.error("Erreur API growth:", error);
     if (error.code === 401 || error.message?.includes("invalid_grant")) {
       req.session.destroy();
       return res.status(401).json({ success: false, error: "Session expirée." });
