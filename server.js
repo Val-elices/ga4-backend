@@ -14,30 +14,18 @@ const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:3001/auth/cal
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const SESSION_SECRET = process.env.SESSION_SECRET || "ga4-dashboard-secret-changez-moi";
 
-app.use(
-  cors({
-    origin: FRONTEND_URL,
-    credentials: true,
-  })
-);
-
+app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.set("trust proxy", 1);
-app.use(
-  session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      secure: process.env.NODE_ENV === "production",
-      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-      maxAge: 30 * 24 * 60 * 60 * 1000,
-    },
-  })
-);
+app.use(session({
+  secret: SESSION_SECRET, resave: false, saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  },
+}));
 
-function createOAuth2Client() {
-  return new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-}
+function createOAuth2Client() { return new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI); }
 
 function getProperties() {
   const envProps = process.env.GA4_PROPERTIES;
@@ -54,20 +42,15 @@ function getProperties() {
 }
 
 // ════════════════════════════════════════════════════════
-// AUTH ROUTES
+// AUTH
 // ════════════════════════════════════════════════════════
 
 app.get("/auth/login", (req, res) => {
   const oauth2Client = createOAuth2Client();
-  const authUrl = oauth2Client.generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent",
-    scope: [
-      "https://www.googleapis.com/auth/analytics.readonly",
-      "https://www.googleapis.com/auth/userinfo.email",
-    ],
-  });
-  res.redirect(authUrl);
+  res.redirect(oauth2Client.generateAuthUrl({
+    access_type: "offline", prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/analytics.readonly", "https://www.googleapis.com/auth/userinfo.email"],
+  }));
 });
 
 app.get("/auth/callback", async (req, res) => {
@@ -90,22 +73,13 @@ app.get("/auth/callback", async (req, res) => {
 });
 
 app.get("/auth/status", (req, res) => {
-  if (req.session.tokens) {
-    res.json({ authenticated: true, email: req.session.userEmail });
-  } else {
-    res.json({ authenticated: false });
-  }
+  res.json(req.session.tokens ? { authenticated: true, email: req.session.userEmail } : { authenticated: false });
 });
 
-app.get("/auth/logout", (req, res) => {
-  req.session.destroy();
-  res.json({ success: true });
-});
+app.get("/auth/logout", (req, res) => { req.session.destroy(); res.json({ success: true }); });
 
 function requireAuth(req, res, next) {
-  if (!req.session.tokens) {
-    return res.status(401).json({ success: false, error: "Non authentifié." });
-  }
+  if (!req.session.tokens) return res.status(401).json({ success: false, error: "Non authentifié." });
   next();
 }
 
@@ -123,13 +97,8 @@ function parseDateRange(query) {
   const { days = 30, startDate: qStart, endDate: qEnd } = query;
   const daysNum = parseInt(days);
   let startDate, endDate;
-  if (qStart && qEnd) {
-    startDate = qStart;
-    endDate = qEnd;
-  } else {
-    startDate = `${daysNum}daysAgo`;
-    endDate = "today";
-  }
+  if (qStart && qEnd) { startDate = qStart; endDate = qEnd; }
+  else { startDate = `${daysNum}daysAgo`; endDate = "today"; }
   return { startDate, endDate, daysNum };
 }
 
@@ -137,15 +106,16 @@ function formatDate(yyyymmdd) {
   return `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
 }
 
-function fmt(d) {
-  return d.toISOString().split("T")[0];
+function fmt(d) { return d.toISOString().split("T")[0]; }
+
+function refreshTokens(authClient, session) {
+  if (authClient.credentials.access_token !== session.tokens.access_token) {
+    session.tokens = authClient.credentials;
+  }
 }
 
-function getDateNDaysAgo(n) {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  return d;
-}
+// Small delay to avoid hammering the API
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // ════════════════════════════════════════════════════════
 // REVENUE
@@ -178,12 +148,19 @@ app.get("/api/revenue", requireAuth, async (req, res) => {
     const authClient = getAuthenticatedClient(req.session.tokens);
     const properties = getProperties();
 
-    const results = await Promise.all(
-      properties.map(async (prop) => {
-        const data = await fetchRevenue(authClient, prop.propertyId, startDate, endDate);
-        return { id: `ga4-${prop.propertyId}`, name: prop.name, propertyId: prop.propertyId, data };
-      })
-    );
+    // Batch by 5
+    const results = [];
+    for (let i = 0; i < properties.length; i += 5) {
+      const batch = properties.slice(i, i + 5);
+      const batchResults = await Promise.all(
+        batch.map(async (prop) => {
+          const data = await fetchRevenue(authClient, prop.propertyId, startDate, endDate);
+          return { id: `ga4-${prop.propertyId}`, name: prop.name, propertyId: prop.propertyId, data };
+        })
+      );
+      results.push(...batchResults);
+      if (i + 5 < properties.length) await sleep(200);
+    }
 
     const dateMap = {};
     results.forEach((client) => {
@@ -206,9 +183,7 @@ app.get("/api/revenue", requireAuth, async (req, res) => {
       };
     });
 
-    if (authClient.credentials.access_token !== req.session.tokens.access_token) {
-      req.session.tokens = authClient.credentials;
-    }
+    refreshTokens(authClient, req.session);
 
     res.json({
       success: true, period: { days: daysNum, startDate, endDate },
@@ -226,22 +201,13 @@ app.get("/api/revenue", requireAuth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════
-// TRAFFIC (sessions-based, organic search by channel group)
+// TRAFFIC (sessions-based organic search)
 // ════════════════════════════════════════════════════════
 
 async function fetchTrafficSessions(authClient, propertyId, startDate, endDate) {
   try {
     const analyticsClient = new BetaAnalyticsDataClient({ authClient });
 
-    // Total sessions
-    const [totalRes] = await analyticsClient.runReport({
-      property: `properties/${propertyId}`,
-      dateRanges: [{ startDate, endDate }],
-      metrics: [{ name: "sessions" }],
-    });
-    const totalSessions = totalRes.rows?.[0] ? parseInt(totalRes.rows[0].metricValues[0].value) || 0 : 0;
-
-    // Organic sessions via sessionDefaultChannelGroup
     const [channelRes] = await analyticsClient.runReport({
       property: `properties/${propertyId}`,
       dateRanges: [{ startDate, endDate }],
@@ -249,10 +215,13 @@ async function fetchTrafficSessions(authClient, propertyId, startDate, endDate) 
       metrics: [{ name: "sessions" }],
     });
 
+    let totalSessions = 0;
     let organicSessions = 0;
     (channelRes.rows || []).forEach((row) => {
+      const sessions = parseInt(row.metricValues[0].value) || 0;
+      totalSessions += sessions;
       if (row.dimensionValues[0].value.toLowerCase() === "organic search") {
-        organicSessions = parseInt(row.metricValues[0].value) || 0;
+        organicSessions = sessions;
       }
     });
 
@@ -267,7 +236,6 @@ async function fetchOrganicMonthly(authClient, propertyId) {
   try {
     const analyticsClient = new BetaAnalyticsDataClient({ authClient });
 
-    // Get monthly sessions with channel group dimension, then filter organic
     const [response] = await analyticsClient.runReport({
       property: `properties/${propertyId}`,
       dateRanges: [{ startDate: "25monthsAgo", endDate: "today" }],
@@ -303,7 +271,6 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
     const authClient = getAuthenticatedClient(req.session.tokens);
     const properties = getProperties();
 
-    // Calculate comparison periods
     const now = new Date();
     let currentStart, currentEnd;
     if (req.query.startDate && req.query.endDate) {
@@ -317,63 +284,58 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
 
     const diffDays = Math.ceil((currentEnd - currentStart) / (1000 * 60 * 60 * 24));
 
-    // M-1: previous equivalent period
     const prevMonthEnd = new Date(currentStart);
     prevMonthEnd.setDate(prevMonthEnd.getDate() - 1);
     const prevMonthStart = new Date(prevMonthEnd);
     prevMonthStart.setDate(prevMonthStart.getDate() - diffDays);
 
-    // N-1: same dates one year ago
     const prevYearStart = new Date(currentStart);
     prevYearStart.setFullYear(prevYearStart.getFullYear() - 1);
     const prevYearEnd = new Date(currentEnd);
     prevYearEnd.setFullYear(prevYearEnd.getFullYear() - 1);
 
-    const results = await Promise.all(
-      properties.map(async (prop) => {
-        const [current, prevMonth, prevYear, monthlyOrganic] = await Promise.all([
-          fetchTrafficSessions(authClient, prop.propertyId, startDate, endDate),
-          fetchTrafficSessions(authClient, prop.propertyId, fmt(prevMonthStart), fmt(prevMonthEnd)),
-          fetchTrafficSessions(authClient, prop.propertyId, fmt(prevYearStart), fmt(prevYearEnd)),
-          fetchOrganicMonthly(authClient, prop.propertyId),
-        ]);
+    // Process in batches of 3 (each client = 4 API calls, so 3 x 4 = 12 parallel calls)
+    const results = [];
+    const batchSize = 3;
+    for (let i = 0; i < properties.length; i += batchSize) {
+      const batch = properties.slice(i, i + batchSize);
+      console.log(`Traffic batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(properties.length / batchSize)}`);
 
-        const organicVsM1 = prevMonth.organicSessions > 0
-          ? ((current.organicSessions - prevMonth.organicSessions) / prevMonth.organicSessions) * 100
-          : 0;
+      const batchResults = await Promise.all(
+        batch.map(async (prop) => {
+          const [current, prevMonth, prevYear, monthlyOrganic] = await Promise.all([
+            fetchTrafficSessions(authClient, prop.propertyId, startDate, endDate),
+            fetchTrafficSessions(authClient, prop.propertyId, fmt(prevMonthStart), fmt(prevMonthEnd)),
+            fetchTrafficSessions(authClient, prop.propertyId, fmt(prevYearStart), fmt(prevYearEnd)),
+            fetchOrganicMonthly(authClient, prop.propertyId),
+          ]);
 
-        const organicVsN1 = prevYear.organicSessions > 0
-          ? ((current.organicSessions - prevYear.organicSessions) / prevYear.organicSessions) * 100
-          : 0;
+          const organicVsM1 = prevMonth.organicSessions > 0
+            ? ((current.organicSessions - prevMonth.organicSessions) / prevMonth.organicSessions) * 100 : 0;
+          const organicVsN1 = prevYear.organicSessions > 0
+            ? ((current.organicSessions - prevYear.organicSessions) / prevYear.organicSessions) * 100 : 0;
 
-        return {
-          id: `ga4-${prop.propertyId}`,
-          name: prop.name,
-          propertyId: prop.propertyId,
-          totalSessions: current.totalSessions,
-          organicSessions: current.organicSessions,
-          organicVsM1: Math.round(organicVsM1 * 10) / 10,
-          organicVsN1: Math.round(organicVsN1 * 10) / 10,
-          prevMonthOrganic: prevMonth.organicSessions,
-          prevYearOrganic: prevYear.organicSessions,
-          monthlyOrganic,
-        };
-      })
-    );
+          return {
+            id: `ga4-${prop.propertyId}`, name: prop.name, propertyId: prop.propertyId,
+            totalSessions: current.totalSessions, organicSessions: current.organicSessions,
+            organicVsM1: Math.round(organicVsM1 * 10) / 10,
+            organicVsN1: Math.round(organicVsN1 * 10) / 10,
+            prevMonthOrganic: prevMonth.organicSessions,
+            prevYearOrganic: prevYear.organicSessions,
+            monthlyOrganic,
+          };
+        })
+      );
+      results.push(...batchResults);
+      if (i + batchSize < properties.length) await sleep(500);
+    }
 
-    // Global averages
     const validM1 = results.filter((r) => r.prevMonthOrganic > 0);
     const validN1 = results.filter((r) => r.prevYearOrganic > 0);
-    const avgM1 = validM1.length > 0
-      ? Math.round((validM1.reduce((s, r) => s + r.organicVsM1, 0) / validM1.length) * 10) / 10
-      : 0;
-    const avgN1 = validN1.length > 0
-      ? Math.round((validN1.reduce((s, r) => s + r.organicVsN1, 0) / validN1.length) * 10) / 10
-      : 0;
+    const avgM1 = validM1.length > 0 ? Math.round((validM1.reduce((s, r) => s + r.organicVsM1, 0) / validM1.length) * 10) / 10 : 0;
+    const avgN1 = validN1.length > 0 ? Math.round((validN1.reduce((s, r) => s + r.organicVsN1, 0) / validN1.length) * 10) / 10 : 0;
 
-    if (authClient.credentials.access_token !== req.session.tokens.access_token) {
-      req.session.tokens = authClient.credentials;
-    }
+    refreshTokens(authClient, req.session);
 
     res.json({
       success: true,
@@ -381,8 +343,7 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
       summary: {
         totalSessions: results.reduce((s, r) => s + r.totalSessions, 0),
         totalOrganic: results.reduce((s, r) => s + r.organicSessions, 0),
-        avgOrganicVsM1: avgM1,
-        avgOrganicVsN1: avgN1,
+        avgOrganicVsM1: avgM1, avgOrganicVsN1: avgN1,
         clientCount: results.length,
       },
     });
@@ -397,7 +358,7 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════
-// CUMULATIVE GROWTH (all clients combined)
+// CUMULATIVE GROWTH (loaded separately, on demand)
 // ════════════════════════════════════════════════════════
 
 app.get("/api/growth", requireAuth, async (req, res) => {
@@ -405,7 +366,6 @@ app.get("/api/growth", requireAuth, async (req, res) => {
     const authClient = getAuthenticatedClient(req.session.tokens);
     const properties = getProperties();
 
-    // Periods: 1m, 6m, 12m, 18m, 24m
     const periods = [
       { label: "1 mois", days: 30 },
       { label: "6 mois", days: 180 },
@@ -417,6 +377,8 @@ app.get("/api/growth", requireAuth, async (req, res) => {
     const growthResults = [];
 
     for (const period of periods) {
+      console.log(`Growth: calculating ${period.label}...`);
+
       const currentEnd = new Date();
       const currentStart = new Date();
       currentStart.setDate(currentStart.getDate() - period.days);
@@ -426,46 +388,38 @@ app.get("/api/growth", requireAuth, async (req, res) => {
       const prevStart = new Date(prevEnd);
       prevStart.setDate(prevStart.getDate() - period.days);
 
-      // Fetch organic sessions for all properties for current and previous periods
-      const results = await Promise.all(
-        properties.map(async (prop) => {
-          const [current, prev] = await Promise.all([
-            fetchTrafficSessions(authClient, prop.propertyId, fmt(currentStart), fmt(currentEnd)),
-            fetchTrafficSessions(authClient, prop.propertyId, fmt(prevStart), fmt(prevEnd)),
-          ]);
-          return {
-            currentOrganic: current.organicSessions,
-            prevOrganic: prev.organicSessions,
-          };
-        })
-      );
+      // Batch by 3
+      const results = [];
+      for (let i = 0; i < properties.length; i += 3) {
+        const batch = properties.slice(i, i + 3);
+        const batchResults = await Promise.all(
+          batch.map(async (prop) => {
+            const [current, prev] = await Promise.all([
+              fetchTrafficSessions(authClient, prop.propertyId, fmt(currentStart), fmt(currentEnd)),
+              fetchTrafficSessions(authClient, prop.propertyId, fmt(prevStart), fmt(prevEnd)),
+            ]);
+            return { currentOrganic: current.organicSessions, prevOrganic: prev.organicSessions };
+          })
+        );
+        results.push(...batchResults);
+        if (i + 3 < properties.length) await sleep(300);
+      }
 
-      // Cumulative: sum all clients organic sessions, then compute growth
       const totalCurrentOrganic = results.reduce((s, r) => s + r.currentOrganic, 0);
       const totalPrevOrganic = results.reduce((s, r) => s + r.prevOrganic, 0);
-
       const growth = totalPrevOrganic > 0
-        ? ((totalCurrentOrganic - totalPrevOrganic) / totalPrevOrganic) * 100
-        : 0;
+        ? ((totalCurrentOrganic - totalPrevOrganic) / totalPrevOrganic) * 100 : 0;
 
       growthResults.push({
-        label: period.label,
-        days: period.days,
-        currentOrganic: totalCurrentOrganic,
-        prevOrganic: totalPrevOrganic,
+        label: period.label, days: period.days,
+        currentOrganic: totalCurrentOrganic, prevOrganic: totalPrevOrganic,
         growth: Math.round(growth * 10) / 10,
       });
     }
 
-    if (authClient.credentials.access_token !== req.session.tokens.access_token) {
-      req.session.tokens = authClient.credentials;
-    }
+    refreshTokens(authClient, req.session);
 
-    res.json({
-      success: true,
-      growth: growthResults,
-      clientCount: properties.length,
-    });
+    res.json({ success: true, growth: growthResults, clientCount: properties.length });
   } catch (error) {
     console.error("Erreur API growth:", error);
     if (error.code === 401 || error.message?.includes("invalid_grant")) {
@@ -481,10 +435,7 @@ app.get("/api/growth", requireAuth, async (req, res) => {
 // ════════════════════════════════════════════════════════
 
 app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok", properties: getProperties().length,
-    authenticated: !!req.session?.tokens, timestamp: new Date().toISOString(),
-  });
+  res.json({ status: "ok", properties: getProperties().length, authenticated: !!req.session?.tokens, timestamp: new Date().toISOString() });
 });
 
 app.get("/api/properties", (req, res) => {
