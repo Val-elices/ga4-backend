@@ -114,7 +114,6 @@ function refreshTokens(authClient, session) {
   }
 }
 
-// Small delay to avoid hammering the API
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // ════════════════════════════════════════════════════════
@@ -148,7 +147,6 @@ app.get("/api/revenue", requireAuth, async (req, res) => {
     const authClient = getAuthenticatedClient(req.session.tokens);
     const properties = getProperties();
 
-    // Batch by 5
     const results = [];
     for (let i = 0; i < properties.length; i += 5) {
       const batch = properties.slice(i, i + 5);
@@ -184,7 +182,6 @@ app.get("/api/revenue", requireAuth, async (req, res) => {
     });
 
     refreshTokens(authClient, req.session);
-
     res.json({
       success: true, period: { days: daysNum, startDate, endDate },
       clients: clientStats, dailyData,
@@ -193,38 +190,31 @@ app.get("/api/revenue", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("Erreur API revenue:", error);
     if (error.code === 401 || error.message?.includes("invalid_grant")) {
-      req.session.destroy();
-      return res.status(401).json({ success: false, error: "Session expirée." });
+      req.session.destroy(); return res.status(401).json({ success: false, error: "Session expirée." });
     }
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ════════════════════════════════════════════════════════
-// TRAFFIC (sessions-based organic search)
+// TRAFFIC
 // ════════════════════════════════════════════════════════
 
 async function fetchTrafficSessions(authClient, propertyId, startDate, endDate) {
   try {
     const analyticsClient = new BetaAnalyticsDataClient({ authClient });
-
     const [channelRes] = await analyticsClient.runReport({
       property: `properties/${propertyId}`,
       dateRanges: [{ startDate, endDate }],
       dimensions: [{ name: "sessionDefaultChannelGroup" }],
       metrics: [{ name: "sessions" }],
     });
-
-    let totalSessions = 0;
-    let organicSessions = 0;
+    let totalSessions = 0, organicSessions = 0;
     (channelRes.rows || []).forEach((row) => {
       const sessions = parseInt(row.metricValues[0].value) || 0;
       totalSessions += sessions;
-      if (row.dimensionValues[0].value.toLowerCase() === "organic search") {
-        organicSessions = sessions;
-      }
+      if (row.dimensionValues[0].value.toLowerCase() === "organic search") organicSessions = sessions;
     });
-
     return { totalSessions, organicSessions };
   } catch (error) {
     console.error(`Erreur GA4 traffic ${propertyId}:`, error.message);
@@ -235,30 +225,21 @@ async function fetchTrafficSessions(authClient, propertyId, startDate, endDate) 
 async function fetchOrganicMonthly(authClient, propertyId) {
   try {
     const analyticsClient = new BetaAnalyticsDataClient({ authClient });
-
     const [response] = await analyticsClient.runReport({
       property: `properties/${propertyId}`,
       dateRanges: [{ startDate: "25monthsAgo", endDate: "today" }],
-      dimensions: [
-        { name: "yearMonth" },
-        { name: "sessionDefaultChannelGroup" },
-      ],
+      dimensions: [{ name: "yearMonth" }, { name: "sessionDefaultChannelGroup" }],
       metrics: [{ name: "sessions" }],
       orderBys: [{ dimension: { dimensionName: "yearMonth" }, desc: false }],
     });
-
     const monthlyMap = {};
     (response.rows || []).forEach((row) => {
       const ym = row.dimensionValues[0].value;
-      const channel = row.dimensionValues[1].value.toLowerCase();
-      if (channel === "organic search") {
+      if (row.dimensionValues[1].value.toLowerCase() === "organic search") {
         monthlyMap[ym] = (monthlyMap[ym] || 0) + (parseInt(row.metricValues[0].value) || 0);
       }
     });
-
-    return Object.entries(monthlyMap)
-      .map(([yearMonth, sessions]) => ({ yearMonth, sessions }))
-      .sort((a, b) => a.yearMonth.localeCompare(b.yearMonth));
+    return Object.entries(monthlyMap).map(([yearMonth, sessions]) => ({ yearMonth, sessions })).sort((a, b) => a.yearMonth.localeCompare(b.yearMonth));
   } catch (error) {
     console.error(`Erreur GA4 organic monthly ${propertyId}:`, error.message);
     return [];
@@ -274,33 +255,22 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
     const now = new Date();
     let currentStart, currentEnd;
     if (req.query.startDate && req.query.endDate) {
-      currentStart = new Date(req.query.startDate);
-      currentEnd = new Date(req.query.endDate);
+      currentStart = new Date(req.query.startDate); currentEnd = new Date(req.query.endDate);
     } else {
-      currentEnd = now;
-      currentStart = new Date(now);
+      currentEnd = now; currentStart = new Date(now);
       currentStart.setDate(currentStart.getDate() - (parseInt(req.query.days) || 30));
     }
-
     const diffDays = Math.ceil((currentEnd - currentStart) / (1000 * 60 * 60 * 24));
 
-    const prevMonthEnd = new Date(currentStart);
-    prevMonthEnd.setDate(prevMonthEnd.getDate() - 1);
-    const prevMonthStart = new Date(prevMonthEnd);
-    prevMonthStart.setDate(prevMonthStart.getDate() - diffDays);
+    const prevMonthEnd = new Date(currentStart); prevMonthEnd.setDate(prevMonthEnd.getDate() - 1);
+    const prevMonthStart = new Date(prevMonthEnd); prevMonthStart.setDate(prevMonthStart.getDate() - diffDays);
+    const prevYearStart = new Date(currentStart); prevYearStart.setFullYear(prevYearStart.getFullYear() - 1);
+    const prevYearEnd = new Date(currentEnd); prevYearEnd.setFullYear(prevYearEnd.getFullYear() - 1);
 
-    const prevYearStart = new Date(currentStart);
-    prevYearStart.setFullYear(prevYearStart.getFullYear() - 1);
-    const prevYearEnd = new Date(currentEnd);
-    prevYearEnd.setFullYear(prevYearEnd.getFullYear() - 1);
-
-    // Process in batches of 3 (each client = 4 API calls, so 3 x 4 = 12 parallel calls)
     const results = [];
-    const batchSize = 3;
-    for (let i = 0; i < properties.length; i += batchSize) {
-      const batch = properties.slice(i, i + batchSize);
-      console.log(`Traffic batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(properties.length / batchSize)}`);
-
+    for (let i = 0; i < properties.length; i += 3) {
+      const batch = properties.slice(i, i + 3);
+      console.log(`Traffic batch ${Math.floor(i / 3) + 1}/${Math.ceil(properties.length / 3)}`);
       const batchResults = await Promise.all(
         batch.map(async (prop) => {
           const [current, prevMonth, prevYear, monthlyOrganic] = await Promise.all([
@@ -309,25 +279,19 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
             fetchTrafficSessions(authClient, prop.propertyId, fmt(prevYearStart), fmt(prevYearEnd)),
             fetchOrganicMonthly(authClient, prop.propertyId),
           ]);
-
-          const organicVsM1 = prevMonth.organicSessions > 0
-            ? ((current.organicSessions - prevMonth.organicSessions) / prevMonth.organicSessions) * 100 : 0;
-          const organicVsN1 = prevYear.organicSessions > 0
-            ? ((current.organicSessions - prevYear.organicSessions) / prevYear.organicSessions) * 100 : 0;
-
+          const organicVsM1 = prevMonth.organicSessions > 0 ? ((current.organicSessions - prevMonth.organicSessions) / prevMonth.organicSessions) * 100 : 0;
+          const organicVsN1 = prevYear.organicSessions > 0 ? ((current.organicSessions - prevYear.organicSessions) / prevYear.organicSessions) * 100 : 0;
           return {
             id: `ga4-${prop.propertyId}`, name: prop.name, propertyId: prop.propertyId,
             totalSessions: current.totalSessions, organicSessions: current.organicSessions,
-            organicVsM1: Math.round(organicVsM1 * 10) / 10,
-            organicVsN1: Math.round(organicVsN1 * 10) / 10,
-            prevMonthOrganic: prevMonth.organicSessions,
-            prevYearOrganic: prevYear.organicSessions,
+            organicVsM1: Math.round(organicVsM1 * 10) / 10, organicVsN1: Math.round(organicVsN1 * 10) / 10,
+            prevMonthOrganic: prevMonth.organicSessions, prevYearOrganic: prevYear.organicSessions,
             monthlyOrganic,
           };
         })
       );
       results.push(...batchResults);
-      if (i + batchSize < properties.length) await sleep(500);
+      if (i + 3 < properties.length) await sleep(500);
     }
 
     const validM1 = results.filter((r) => r.prevMonthOrganic > 0);
@@ -336,10 +300,8 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
     const avgN1 = validN1.length > 0 ? Math.round((validN1.reduce((s, r) => s + r.organicVsN1, 0) / validN1.length) * 10) / 10 : 0;
 
     refreshTokens(authClient, req.session);
-
     res.json({
-      success: true,
-      clients: results,
+      success: true, clients: results,
       summary: {
         totalSessions: results.reduce((s, r) => s + r.totalSessions, 0),
         totalOrganic: results.reduce((s, r) => s + r.organicSessions, 0),
@@ -350,81 +312,112 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("Erreur API traffic:", error);
     if (error.code === 401 || error.message?.includes("invalid_grant")) {
-      req.session.destroy();
-      return res.status(401).json({ success: false, error: "Session expirée." });
+      req.session.destroy(); return res.status(401).json({ success: false, error: "Session expirée." });
     }
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ════════════════════════════════════════════════════════
-// CUMULATIVE GROWTH (loaded separately, on demand)
+// GROWTH FROM FIXED REFERENCE DATE
+// Compare: reference month organic sessions vs current month
+// Then show month-by-month evolution from reference date
 // ════════════════════════════════════════════════════════
 
 app.get("/api/growth", requireAuth, async (req, res) => {
   try {
+    const { refDate } = req.query; // format: YYYY-MM-DD
+    if (!refDate) return res.status(400).json({ success: false, error: "refDate requis (ex: 2024-01-01)" });
+
     const authClient = getAuthenticatedClient(req.session.tokens);
     const properties = getProperties();
 
-    const periods = [
-      { label: "1 mois", days: 30 },
-      { label: "6 mois", days: 180 },
-      { label: "12 mois", days: 365 },
-      { label: "18 mois", days: 548 },
-      { label: "24 mois", days: 730 },
-    ];
+    // We fetch monthly organic data from refDate to today for all clients
+    // Then aggregate by month across all clients
+    console.log(`Growth: fetching from ${refDate} to today for ${properties.length} properties`);
 
-    const growthResults = [];
+    const allMonthlyData = [];
+    for (let i = 0; i < properties.length; i += 3) {
+      const batch = properties.slice(i, i + 3);
+      console.log(`Growth batch ${Math.floor(i / 3) + 1}/${Math.ceil(properties.length / 3)}`);
 
-    for (const period of periods) {
-      console.log(`Growth: calculating ${period.label}...`);
+      const batchResults = await Promise.all(
+        batch.map(async (prop) => {
+          try {
+            const analyticsClient = new BetaAnalyticsDataClient({ authClient });
+            const [response] = await analyticsClient.runReport({
+              property: `properties/${prop.propertyId}`,
+              dateRanges: [{ startDate: refDate, endDate: "today" }],
+              dimensions: [{ name: "yearMonth" }, { name: "sessionDefaultChannelGroup" }],
+              metrics: [{ name: "sessions" }],
+              orderBys: [{ dimension: { dimensionName: "yearMonth" }, desc: false }],
+            });
 
-      const currentEnd = new Date();
-      const currentStart = new Date();
-      currentStart.setDate(currentStart.getDate() - period.days);
-
-      const prevEnd = new Date(currentStart);
-      prevEnd.setDate(prevEnd.getDate() - 1);
-      const prevStart = new Date(prevEnd);
-      prevStart.setDate(prevStart.getDate() - period.days);
-
-      // Batch by 3
-      const results = [];
-      for (let i = 0; i < properties.length; i += 3) {
-        const batch = properties.slice(i, i + 3);
-        const batchResults = await Promise.all(
-          batch.map(async (prop) => {
-            const [current, prev] = await Promise.all([
-              fetchTrafficSessions(authClient, prop.propertyId, fmt(currentStart), fmt(currentEnd)),
-              fetchTrafficSessions(authClient, prop.propertyId, fmt(prevStart), fmt(prevEnd)),
-            ]);
-            return { currentOrganic: current.organicSessions, prevOrganic: prev.organicSessions };
-          })
-        );
-        results.push(...batchResults);
-        if (i + 3 < properties.length) await sleep(300);
-      }
-
-      const totalCurrentOrganic = results.reduce((s, r) => s + r.currentOrganic, 0);
-      const totalPrevOrganic = results.reduce((s, r) => s + r.prevOrganic, 0);
-      const growth = totalPrevOrganic > 0
-        ? ((totalCurrentOrganic - totalPrevOrganic) / totalPrevOrganic) * 100 : 0;
-
-      growthResults.push({
-        label: period.label, days: period.days,
-        currentOrganic: totalCurrentOrganic, prevOrganic: totalPrevOrganic,
-        growth: Math.round(growth * 10) / 10,
-      });
+            const monthly = {};
+            (response.rows || []).forEach((row) => {
+              const ym = row.dimensionValues[0].value;
+              if (row.dimensionValues[1].value.toLowerCase() === "organic search") {
+                monthly[ym] = (monthly[ym] || 0) + (parseInt(row.metricValues[0].value) || 0);
+              }
+            });
+            return monthly;
+          } catch (err) {
+            console.error(`Growth error for ${prop.propertyId}:`, err.message);
+            return {};
+          }
+        })
+      );
+      allMonthlyData.push(...batchResults);
+      if (i + 3 < properties.length) await sleep(500);
     }
+
+    // Aggregate: sum all clients per month
+    const aggregated = {};
+    allMonthlyData.forEach((clientMonthly) => {
+      Object.entries(clientMonthly).forEach(([ym, sessions]) => {
+        aggregated[ym] = (aggregated[ym] || 0) + sessions;
+      });
+    });
+
+    // Sort by yearMonth
+    const months = Object.entries(aggregated)
+      .map(([yearMonth, sessions]) => ({ yearMonth, sessions }))
+      .sort((a, b) => a.yearMonth.localeCompare(b.yearMonth));
+
+    if (months.length === 0) {
+      refreshTokens(authClient, req.session);
+      return res.json({ success: true, months: [], referenceDate: refDate, referenceSessions: 0, growth: [] });
+    }
+
+    // Reference = first month
+    const refSessions = months[0].sessions;
+
+    // Calculate growth for each month vs reference
+    const growth = months.map((m) => ({
+      yearMonth: m.yearMonth,
+      sessions: m.sessions,
+      growthVsRef: refSessions > 0 ? Math.round(((m.sessions - refSessions) / refSessions) * 1000) / 10 : 0,
+    }));
 
     refreshTokens(authClient, req.session);
 
-    res.json({ success: true, growth: growthResults, clientCount: properties.length });
+    res.json({
+      success: true,
+      referenceDate: refDate,
+      referenceMonth: months[0].yearMonth,
+      referenceSessions: refSessions,
+      currentMonth: months[months.length - 1].yearMonth,
+      currentSessions: months[months.length - 1].sessions,
+      totalGrowth: refSessions > 0
+        ? Math.round(((months[months.length - 1].sessions - refSessions) / refSessions) * 1000) / 10
+        : 0,
+      months: growth,
+      clientCount: properties.length,
+    });
   } catch (error) {
     console.error("Erreur API growth:", error);
     if (error.code === 401 || error.message?.includes("invalid_grant")) {
-      req.session.destroy();
-      return res.status(401).json({ success: false, error: "Session expirée." });
+      req.session.destroy(); return res.status(401).json({ success: false, error: "Session expirée." });
     }
     res.status(500).json({ success: false, error: error.message });
   }
