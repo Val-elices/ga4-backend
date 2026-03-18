@@ -294,10 +294,12 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
       if (i + 3 < properties.length) await sleep(500);
     }
 
-    const validM1 = results.filter((r) => r.prevMonthOrganic > 0);
-    const validN1 = results.filter((r) => r.prevYearOrganic > 0);
-    const avgM1 = validM1.length > 0 ? Math.round((validM1.reduce((s, r) => s + r.organicVsM1, 0) / validM1.length) * 10) / 10 : 0;
-    const avgN1 = validN1.length > 0 ? Math.round((validN1.reduce((s, r) => s + r.organicVsN1, 0) / validN1.length) * 10) / 10 : 0;
+    // Cumulative: sum all clients organic, then compute % change
+    const totalCurrentOrganic = results.reduce((s, r) => s + r.organicSessions, 0);
+    const totalPrevMonthOrganic = results.reduce((s, r) => s + r.prevMonthOrganic, 0);
+    const totalPrevYearOrganic = results.reduce((s, r) => s + r.prevYearOrganic, 0);
+    const cumulM1 = totalPrevMonthOrganic > 0 ? Math.round(((totalCurrentOrganic - totalPrevMonthOrganic) / totalPrevMonthOrganic) * 1000) / 10 : 0;
+    const cumulN1 = totalPrevYearOrganic > 0 ? Math.round(((totalCurrentOrganic - totalPrevYearOrganic) / totalPrevYearOrganic) * 1000) / 10 : 0;
 
     refreshTokens(authClient, req.session);
     res.json({
@@ -305,7 +307,7 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
       summary: {
         totalSessions: results.reduce((s, r) => s + r.totalSessions, 0),
         totalOrganic: results.reduce((s, r) => s + r.organicSessions, 0),
-        avgOrganicVsM1: avgM1, avgOrganicVsN1: avgN1,
+        avgOrganicVsM1: cumulM1, avgOrganicVsN1: cumulN1,
         clientCount: results.length,
       },
     });
