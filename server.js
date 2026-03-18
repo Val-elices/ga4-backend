@@ -329,43 +329,37 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
     const prevYearEnd = new Date(currentEnd);
     prevYearEnd.setFullYear(prevYearEnd.getFullYear() - 1);
 
-    // Process in batches of 5 to avoid Google API rate limits
-	const results = [];
-	const batchSize = 5;
-	for (let i = 0; i < properties.length; i += batchSize) {
-	  const batch = properties.slice(i, i + batchSize);
-	  const batchResults = await Promise.all(
-		batch.map(async (prop) => {
-		  const [current, prevMonth, prevYear, monthlyOrganic] = await Promise.all([
-			fetchTrafficSessions(authClient, prop.propertyId, startDate, endDate),
-			fetchTrafficSessions(authClient, prop.propertyId, fmt(prevMonthStart), fmt(prevMonthEnd)),
-			fetchTrafficSessions(authClient, prop.propertyId, fmt(prevYearStart), fmt(prevYearEnd)),
-			fetchOrganicMonthly(authClient, prop.propertyId),
-		  ]);
+    const results = await Promise.all(
+      properties.map(async (prop) => {
+        const [current, prevMonth, prevYear, monthlyOrganic] = await Promise.all([
+          fetchTrafficSessions(authClient, prop.propertyId, startDate, endDate),
+          fetchTrafficSessions(authClient, prop.propertyId, fmt(prevMonthStart), fmt(prevMonthEnd)),
+          fetchTrafficSessions(authClient, prop.propertyId, fmt(prevYearStart), fmt(prevYearEnd)),
+          fetchOrganicMonthly(authClient, prop.propertyId),
+        ]);
 
-		  const organicVsM1 = prevMonth.organicSessions > 0
-			? ((current.organicSessions - prevMonth.organicSessions) / prevMonth.organicSessions) * 100
-			: 0;
-		  const organicVsN1 = prevYear.organicSessions > 0
-			? ((current.organicSessions - prevYear.organicSessions) / prevYear.organicSessions) * 100
-			: 0;
+        const organicVsM1 = prevMonth.organicSessions > 0
+          ? ((current.organicSessions - prevMonth.organicSessions) / prevMonth.organicSessions) * 100
+          : 0;
 
-		  return {
-			id: `ga4-${prop.propertyId}`,
-			name: prop.name,
-			propertyId: prop.propertyId,
-			totalSessions: current.totalSessions,
-			organicSessions: current.organicSessions,
-			organicVsM1: Math.round(organicVsM1 * 10) / 10,
-			organicVsN1: Math.round(organicVsN1 * 10) / 10,
-			prevMonthOrganic: prevMonth.organicSessions,
-			prevYearOrganic: prevYear.organicSessions,
-			monthlyOrganic,
-		  };
-		})
-	  );
-	  results.push(...batchResults);
-	}
+        const organicVsN1 = prevYear.organicSessions > 0
+          ? ((current.organicSessions - prevYear.organicSessions) / prevYear.organicSessions) * 100
+          : 0;
+
+        return {
+          id: `ga4-${prop.propertyId}`,
+          name: prop.name,
+          propertyId: prop.propertyId,
+          totalSessions: current.totalSessions,
+          organicSessions: current.organicSessions,
+          organicVsM1: Math.round(organicVsM1 * 10) / 10,
+          organicVsN1: Math.round(organicVsN1 * 10) / 10,
+          prevMonthOrganic: prevMonth.organicSessions,
+          prevYearOrganic: prevYear.organicSessions,
+          monthlyOrganic,
+        };
+      })
+    );
 
     // Global averages
     const validM1 = results.filter((r) => r.prevMonthOrganic > 0);
@@ -422,41 +416,46 @@ app.get("/api/growth", requireAuth, async (req, res) => {
 
     const growthResults = [];
 
-	for (const period of periods) {
-	  const currentEnd = new Date();
-	  const currentStart = new Date();
-	  currentStart.setDate(currentStart.getDate() - period.days);
+    for (const period of periods) {
+      const currentEnd = new Date();
+      const currentStart = new Date();
+      currentStart.setDate(currentStart.getDate() - period.days);
 
-	  const prevEnd = new Date(currentStart);
-	  prevEnd.setDate(prevEnd.getDate() - 1);
-	  const prevStart = new Date(prevEnd);
-	  prevStart.setDate(prevStart.getDate() - period.days);
+      const prevEnd = new Date(currentStart);
+      prevEnd.setDate(prevEnd.getDate() - 1);
+      const prevStart = new Date(prevEnd);
+      prevStart.setDate(prevStart.getDate() - period.days);
 
-	  const results = [];
-	  for (let i = 0; i < properties.length; i += 5) {
-		const batch = properties.slice(i, i + 5);
-		const batchResults = await Promise.all(
-		  batch.map(async (prop) => {
-			const [current, prev] = await Promise.all([
-			  fetchTrafficSessions(authClient, prop.propertyId, fmt(currentStart), fmt(currentEnd)),
-			  fetchTrafficSessions(authClient, prop.propertyId, fmt(prevStart), fmt(prevEnd)),
-			]);
-			return { currentOrganic: current.organicSessions, prevOrganic: prev.organicSessions };
-		  })
-		);
-		results.push(...batchResults);
-	  }
+      // Fetch organic sessions for all properties for current and previous periods
+      const results = await Promise.all(
+        properties.map(async (prop) => {
+          const [current, prev] = await Promise.all([
+            fetchTrafficSessions(authClient, prop.propertyId, fmt(currentStart), fmt(currentEnd)),
+            fetchTrafficSessions(authClient, prop.propertyId, fmt(prevStart), fmt(prevEnd)),
+          ]);
+          return {
+            currentOrganic: current.organicSessions,
+            prevOrganic: prev.organicSessions,
+          };
+        })
+      );
 
-	  const totalCurrentOrganic = results.reduce((s, r) => s + r.currentOrganic, 0);
-	  const totalPrevOrganic = results.reduce((s, r) => s + r.prevOrganic, 0);
-	  const growth = totalPrevOrganic > 0 ? ((totalCurrentOrganic - totalPrevOrganic) / totalPrevOrganic) * 100 : 0;
+      // Cumulative: sum all clients organic sessions, then compute growth
+      const totalCurrentOrganic = results.reduce((s, r) => s + r.currentOrganic, 0);
+      const totalPrevOrganic = results.reduce((s, r) => s + r.prevOrganic, 0);
 
-	  growthResults.push({
-		label: period.label, days: period.days,
-		currentOrganic: totalCurrentOrganic, prevOrganic: totalPrevOrganic,
-		growth: Math.round(growth * 10) / 10,
-	  });
-	}
+      const growth = totalPrevOrganic > 0
+        ? ((totalCurrentOrganic - totalPrevOrganic) / totalPrevOrganic) * 100
+        : 0;
+
+      growthResults.push({
+        label: period.label,
+        days: period.days,
+        currentOrganic: totalCurrentOrganic,
+        prevOrganic: totalPrevOrganic,
+        growth: Math.round(growth * 10) / 10,
+      });
+    }
 
     if (authClient.credentials.access_token !== req.session.tokens.access_token) {
       req.session.tokens = authClient.credentials;
