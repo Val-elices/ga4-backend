@@ -328,17 +328,26 @@ app.get("/api/traffic", requireAuth, async (req, res) => {
 
 app.get("/api/growth", requireAuth, async (req, res) => {
   try {
-    const { refDate } = req.query; // format: YYYY-MM-DD
-    if (!refDate) return res.status(400).json({ success: false, error: "refDate requis (ex: 2024-01-01)" });
-
     const authClient = getAuthenticatedClient(req.session.tokens);
     const properties = getProperties();
 
-    // We fetch monthly organic data from refDate to today for all clients
-    // Then aggregate by month across all clients
-    console.log(`Growth: fetching from ${refDate} to today for ${properties.length} properties`);
+    const periods = [
+      { label: "1 mois", monthsAgo: 1 },
+      { label: "6 mois", monthsAgo: 6 },
+      { label: "12 mois", monthsAgo: 12 },
+      { label: "18 mois", monthsAgo: 18 },
+      { label: "24 mois", monthsAgo: 24 },
+    ];
 
-    const allMonthlyData = [];
+    // Current month range: 1st of this month → today
+    const now = new Date();
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const currentMonthEnd = now;
+
+    // For each client, get current month organic + each comparison month organic
+    console.log(`Growth: fetching for ${properties.length} properties, 5 periods`);
+
+    const clientResults = [];
     for (let i = 0; i < properties.length; i += 3) {
       const batch = properties.slice(i, i + 3);
       console.log(`Growth batch ${Math.floor(i / 3) + 1}/${Math.ceil(properties.length / 3)}`);
@@ -346,88 +355,61 @@ app.get("/api/growth", requireAuth, async (req, res) => {
       const batchResults = await Promise.all(
         batch.map(async (prop) => {
           try {
-            const analyticsClient = new BetaAnalyticsDataClient({ authClient });
-            const [response] = await analyticsClient.runReport({
-              property: `properties/${prop.propertyId}`,
-              dateRanges: [{ startDate: refDate, endDate: "today" }],
-              dimensions: [{ name: "yearMonth" }, { name: "sessionDefaultChannelGroup" }],
-              metrics: [{ name: "sessions" }],
-              orderBys: [{ dimension: { dimensionName: "yearMonth" }, desc: false }],
-            });
+            // Fetch current month
+            const current = await fetchTrafficSessions(authClient, prop.propertyId, fmt(currentMonthStart), fmt(currentMonthEnd));
 
-            const monthly = {};
-            (response.rows || []).forEach((row) => {
-              const ym = row.dimensionValues[0].value;
-              if (row.dimensionValues[1].value.toLowerCase() === "organic search") {
-                monthly[ym] = (monthly[ym] || 0) + (parseInt(row.metricValues[0].value) || 0);
-              }
-            });
-            return monthly;
+            // Fetch each comparison month (full month)
+            const comparisons = {};
+            for (const p of periods) {
+              const compStart = new Date(now.getFullYear(), now.getMonth() - p.monthsAgo, 1);
+              const compEnd = new Date(now.getFullYear(), now.getMonth() - p.monthsAgo + 1, 0); // last day of that month
+              const comp = await fetchTrafficSessions(authClient, prop.propertyId, fmt(compStart), fmt(compEnd));
+              comparisons[p.monthsAgo] = comp.organicSessions;
+            }
+
+            return {
+              propertyId: prop.propertyId,
+              currentOrganic: current.organicSessions,
+              comparisons,
+            };
           } catch (err) {
-            console.error(`Growth error for ${prop.propertyId}:`, err.message);
-            return {};
+            console.error(`Growth error ${prop.propertyId}:`, err.message);
+            return null;
           }
         })
       );
-      allMonthlyData.push(...batchResults);
+      clientResults.push(...batchResults.filter(Boolean));
       if (i + 3 < properties.length) await sleep(500);
     }
 
-    // For each client, compute growth vs their own M0 for each month
-    // Then average across clients for each month
-    const clientGrowths = allMonthlyData.map((clientMonthly) => {
-      const sortedMonths = Object.entries(clientMonthly)
-        .sort(([a], [b]) => a.localeCompare(b));
-      if (sortedMonths.length === 0) return null;
-      const refSessions = sortedMonths[0][1]; // Client's M0
-      if (refSessions === 0) return null;
-      const growth = {};
-      sortedMonths.forEach(([ym, sessions]) => {
-        growth[ym] = (sessions - refSessions) / refSessions; // decimal, e.g. 0.45 = +45%
-      });
-      return growth;
-    }).filter(Boolean);
+    // For each period: compute each client's individual % growth, then average
+    const growthResults = periods.map((p) => {
+      const clientGrowths = clientResults
+        .filter((c) => c.comparisons[p.monthsAgo] > 0) // only clients with data back then
+        .map((c) => (c.currentOrganic - c.comparisons[p.monthsAgo]) / c.comparisons[p.monthsAgo]);
 
-    // Collect all unique months
-    const allYearMonths = new Set();
-    clientGrowths.forEach((cg) => Object.keys(cg).forEach((ym) => allYearMonths.add(ym)));
-    const sortedAllMonths = [...allYearMonths].sort();
-
-    // For each month: average the growth % of all clients that have data for that month
-    const months = sortedAllMonths.map((ym) => {
-      const growthValues = clientGrowths
-        .filter((cg) => cg[ym] !== undefined)
-        .map((cg) => cg[ym]);
-      const avgGrowth = growthValues.length > 0
-        ? growthValues.reduce((s, v) => s + v, 0) / growthValues.length
+      const avgGrowth = clientGrowths.length > 0
+        ? clientGrowths.reduce((s, v) => s + v, 0) / clientGrowths.length
         : 0;
-      // Also compute total sessions for display
-      let totalSessions = 0;
-      allMonthlyData.forEach((cm) => { if (cm[ym]) totalSessions += cm[ym]; });
+
+      const totalCurrentOrganic = clientResults.reduce((s, c) => s + c.currentOrganic, 0);
+      const totalCompOrganic = clientResults.reduce((s, c) => s + (c.comparisons[p.monthsAgo] || 0), 0);
+
       return {
-        yearMonth: ym,
-        sessions: totalSessions,
-        growthVsRef: Math.round(avgGrowth * 1000) / 10, // to percentage with 1 decimal
-        clientsCovered: growthValues.length,
+        label: p.label,
+        monthsAgo: p.monthsAgo,
+        avgGrowth: Math.round(avgGrowth * 1000) / 10,
+        clientsCovered: clientGrowths.length,
+        totalCurrentOrganic,
+        totalCompOrganic,
       };
     });
-
-    if (months.length === 0) {
-      refreshTokens(authClient, req.session);
-      return res.json({ success: true, months: [], referenceDate: refDate, referenceSessions: 0, growth: [] });
-    }
 
     refreshTokens(authClient, req.session);
 
     res.json({
       success: true,
-      referenceDate: refDate,
-      referenceMonth: months[0].yearMonth,
-      referenceSessions: months[0].sessions,
-      currentMonth: months[months.length - 1].yearMonth,
-      currentSessions: months[months.length - 1].sessions,
-      totalGrowth: months[months.length - 1].growthVsRef,
-      months,
+      growth: growthResults,
       clientCount: properties.length,
     });
   } catch (error) {
