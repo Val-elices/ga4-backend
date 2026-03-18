@@ -373,33 +373,49 @@ app.get("/api/growth", requireAuth, async (req, res) => {
       if (i + 3 < properties.length) await sleep(500);
     }
 
-    // Aggregate: sum all clients per month
-    const aggregated = {};
-    allMonthlyData.forEach((clientMonthly) => {
-      Object.entries(clientMonthly).forEach(([ym, sessions]) => {
-        aggregated[ym] = (aggregated[ym] || 0) + sessions;
+    // For each client, compute growth vs their own M0 for each month
+    // Then average across clients for each month
+    const clientGrowths = allMonthlyData.map((clientMonthly) => {
+      const sortedMonths = Object.entries(clientMonthly)
+        .sort(([a], [b]) => a.localeCompare(b));
+      if (sortedMonths.length === 0) return null;
+      const refSessions = sortedMonths[0][1]; // Client's M0
+      if (refSessions === 0) return null;
+      const growth = {};
+      sortedMonths.forEach(([ym, sessions]) => {
+        growth[ym] = (sessions - refSessions) / refSessions; // decimal, e.g. 0.45 = +45%
       });
-    });
+      return growth;
+    }).filter(Boolean);
 
-    // Sort by yearMonth
-    const months = Object.entries(aggregated)
-      .map(([yearMonth, sessions]) => ({ yearMonth, sessions }))
-      .sort((a, b) => a.yearMonth.localeCompare(b.yearMonth));
+    // Collect all unique months
+    const allYearMonths = new Set();
+    clientGrowths.forEach((cg) => Object.keys(cg).forEach((ym) => allYearMonths.add(ym)));
+    const sortedAllMonths = [...allYearMonths].sort();
+
+    // For each month: average the growth % of all clients that have data for that month
+    const months = sortedAllMonths.map((ym) => {
+      const growthValues = clientGrowths
+        .filter((cg) => cg[ym] !== undefined)
+        .map((cg) => cg[ym]);
+      const avgGrowth = growthValues.length > 0
+        ? growthValues.reduce((s, v) => s + v, 0) / growthValues.length
+        : 0;
+      // Also compute total sessions for display
+      let totalSessions = 0;
+      allMonthlyData.forEach((cm) => { if (cm[ym]) totalSessions += cm[ym]; });
+      return {
+        yearMonth: ym,
+        sessions: totalSessions,
+        growthVsRef: Math.round(avgGrowth * 1000) / 10, // to percentage with 1 decimal
+        clientsCovered: growthValues.length,
+      };
+    });
 
     if (months.length === 0) {
       refreshTokens(authClient, req.session);
       return res.json({ success: true, months: [], referenceDate: refDate, referenceSessions: 0, growth: [] });
     }
-
-    // Reference = first month
-    const refSessions = months[0].sessions;
-
-    // Calculate growth for each month vs reference
-    const growth = months.map((m) => ({
-      yearMonth: m.yearMonth,
-      sessions: m.sessions,
-      growthVsRef: refSessions > 0 ? Math.round(((m.sessions - refSessions) / refSessions) * 1000) / 10 : 0,
-    }));
 
     refreshTokens(authClient, req.session);
 
@@ -407,13 +423,11 @@ app.get("/api/growth", requireAuth, async (req, res) => {
       success: true,
       referenceDate: refDate,
       referenceMonth: months[0].yearMonth,
-      referenceSessions: refSessions,
+      referenceSessions: months[0].sessions,
       currentMonth: months[months.length - 1].yearMonth,
       currentSessions: months[months.length - 1].sessions,
-      totalGrowth: refSessions > 0
-        ? Math.round(((months[months.length - 1].sessions - refSessions) / refSessions) * 1000) / 10
-        : 0,
-      months: growth,
+      totalGrowth: months[months.length - 1].growthVsRef,
+      months,
       clientCount: properties.length,
     });
   } catch (error) {
